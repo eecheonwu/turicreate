@@ -422,7 +422,7 @@ test_python_mac_python27_10_13:
     - build_wheel_mac_10_15_python27
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/2.7/bin/virtualenv"
-    - bash scripts/test_wheel.sh
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ bash scripts/test_wheel.sh
   artifacts:
     when: always
     expire_in: 2 weeks
@@ -440,7 +440,7 @@ test_python_mac_python27_10_14:
     - build_wheel_mac_10_15_python27
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/2.7/bin/virtualenv"
-    - bash scripts/test_wheel.sh
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ bash scripts/test_wheel.sh
   artifacts:
     when: always
     expire_in: 2 weeks
@@ -458,7 +458,7 @@ test_python_mac_python35_10_14:
     - build_wheel_mac_10_15_python35
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/3.5/bin/virtualenv"
-    - bash -e scripts/test_wheel.sh
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ bash scripts/test_wheel.sh
   artifacts:
     when: always
     expire_in: 2 weeks
@@ -476,7 +476,7 @@ test_python_mac_python36_10_14:
     - build_wheel_mac_10_15_python36
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/3.6/bin/virtualenv"
-    - bash -e scripts/test_wheel.sh
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ bash scripts/test_wheel.sh
   artifacts:
     when: always
     expire_in: 2 weeks
@@ -494,7 +494,7 @@ test_python_mac_python37_10_14:
     - build_wheel_mac_10_15_python37
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/3.7/bin/virtualenv"
-    - bash -e scripts/test_wheel.sh
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ bash scripts/test_wheel.sh
   artifacts:
     when: always
     expire_in: 2 weeks
@@ -564,7 +564,7 @@ scenario_tests_mac_python27_10_13:
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/2.7/bin/virtualenv"
     - cd scenario-tests
-    - ./run_scenario_tests.sh ../target/turicreate-*.whl
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ ./run_scenario_tests.sh ../target/turicreate-*.whl
 
 scenario_tests_mac_python27_10_14:
   tags:
@@ -578,7 +578,7 @@ scenario_tests_mac_python27_10_14:
   script:
     - export VIRTUALENV="/Library/Frameworks/Python.framework/Versions/2.7/bin/virtualenv"
     - cd scenario-tests
-    - ./run_scenario_tests.sh ../target/turicreate-*.whl
+    - TMPDIR=$HOME/Library/Caches/TemporaryItems/ ./run_scenario_tests.sh ../target/turicreate-*.whl
 
 collect_artifacts:
   tags:
