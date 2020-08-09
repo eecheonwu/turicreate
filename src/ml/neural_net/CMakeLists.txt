@@ -31,6 +31,7 @@ if(APPLE AND HAS_MPS AND NOT TC_BUILD_IOS)
       mps_weight.mm
       mps_device_manager.m
       mps_descriptor_utils.m
+      mps_od_backend.mm
       style_transfer/mps_style_transfer.m
       style_transfer/mps_style_transfer_backend.mm
       style_transfer/mps_style_transfer_utils.m
@@ -59,13 +60,52 @@ endif()
 
 set(TF_BUILD_DIR ${CMAKE_BINARY_DIR}/src/python/turicreate/toolkits)
 
+if(APPLE)
+  set(additonal_unity_neural_net_sources
+    CoreImageImage.mm
+    GrandCentralDispatchQueue.cpp
+    Image_Apple.mm
+  )
+else()
+  set(additonal_unity_neural_net_sources
+    Image_Portable.cpp
+  )
+endif()
+
+# When building for macOS with version higher than 11.0, build the MLCompute-based backend.
+if(APPLE AND HAS_ML_COMPUTE AND NOT TC_BUILD_IOS)
+ make_library(tcmlc OBJECT
+  SOURCES
+    mlc_compute_context.mm
+    mlc_layer_weights.mm
+    mlc_dc_backend.mm
+    mlc_od_backend.mm
+    mlc_utils.mm
+    TCMLComputeDrawingClassifierDescriptor.m
+    TCMLComputeObjectDetectorDescriptor.m
+    TCMLComputeUtil.m
+    TCModelTrainerBackendGraphs.m
+  REQUIRES
+    unity_core
+    ${ACCELERATE}
+)
+  set(additional_unity_neural_net_requirements tcmlc)
+else()
+  set(additional_unity_neural_net_requirements "")
+endif()
+
 make_library(unity_neural_net OBJECT
   SOURCES
+    PortableImage.cpp
+    PosixTaskQueue.cpp
+    TaskQueue.cpp
     compute_context.cpp
     float_array.cpp
     image_augmentation.cpp
     model_spec.cpp
     weight_init.cpp
+    quantization_utils.cpp
+    ${additonal_unity_neural_net_sources}
   REQUIRES
     image_type
     logger

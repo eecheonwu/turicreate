@@ -62,6 +62,24 @@ std::map<std::string, variant_type> get_basic_state() {
           {"verbose", false}};
 }
 
+class FakeImage : public neural_net::Image {
+ public:
+  FakeImage(size_t height, size_t width)
+    : height_(height)
+    , width_(width)
+  {
+  }
+
+  size_t Height() const override { return height_; }
+  size_t Width() const override { return width_; }
+  void WriteHWC(Span<float> buffer) const override {}
+  void WriteCHW(Span<float> buffer) const override {}
+
+ private:
+  size_t height_;
+  size_t width_;
+};
+
 class mock_data_iterator: public data_iterator {
 public:
   using next_batch_call =
@@ -94,6 +112,30 @@ public:
   size_t num_instances_ = 0;
 };
 
+// Subclass of DarknetYOLOModelTrainer that mocks out the decoding of
+// inference batches.
+class TestDarknetYOLOModelTrainer : public DarknetYOLOModelTrainer {
+ public:
+  using decode_output_batch_call = std::function<InferenceOutputBatch(
+      EncodedBatch batch, float confidence_threshold, float iou_threshold)>;
+
+  TestDarknetYOLOModelTrainer(const DarknetYOLOCheckpoint& checkpoint,
+                              neural_net::compute_context* context)
+      : DarknetYOLOModelTrainer(checkpoint, context) {}
+
+  InferenceOutputBatch DecodeOutputBatch(EncodedBatch batch,
+                                         float confidence_threshold,
+                                         float iou_threshold) override {
+    TS_ASSERT(!decode_output_batch_calls_.empty());
+    decode_output_batch_call expected_call =
+        std::move(decode_output_batch_calls_.front());
+    decode_output_batch_calls_.pop_front();
+    return expected_call(std::move(batch), confidence_threshold, iou_threshold);
+  }
+
+  mutable std::deque<decode_output_batch_call> decode_output_batch_calls_;
+};
+
 // Subclass of object_detector that mocks out the methods that inject the
 // object_detector dependencies.
 class test_object_detector: public object_detector {
@@ -106,8 +148,13 @@ public:
       std::function<std::unique_ptr<compute_context>()>;
 
   using create_trainer_call = std::function<std::unique_ptr<ModelTrainer>(
-      const Config& config, const std::string& pretrained_model_path,
-      int random_seed, std::unique_ptr<neural_net::compute_context> context)>;
+      const Config& config, const std::string& pretrained_model_path, int random_seed,
+      std::unique_ptr<neural_net::compute_context> context)>;
+
+  using create_inference_trainer_call =
+      std::function<std::unique_ptr<ModelTrainer>(
+          const Checkpoint& checkpoint,
+          std::unique_ptr<neural_net::compute_context> context)>;
 
   using perform_evaluation_call =
       std::function<variant_type(gl_sframe data, std::string metric,
@@ -150,15 +197,24 @@ public:
   }
 
   std::unique_ptr<ModelTrainer> create_trainer(
-      const Config& config, const std::string& pretrained_model_path,
-      int random_seed,
-      std::unique_ptr<neural_net::compute_context> context) const override {
+      const Config& config, const std::string& pretrained_model_path, int random_seed,
+      std::unique_ptr<neural_net::compute_context> context) const override
+  {
     TS_ASSERT(!create_trainer_calls_.empty());
     create_trainer_call expected_call =
         std::move(create_trainer_calls_.front());
     create_trainer_calls_.pop_front();
-    return expected_call(config, pretrained_model_path, random_seed,
-                         std::move(context));
+    return expected_call(config, pretrained_model_path, random_seed, std::move(context));
+  }
+
+  std::unique_ptr<ModelTrainer> create_inference_trainer(
+      const Checkpoint& checkpoint,
+      std::unique_ptr<neural_net::compute_context> context) const override {
+    TS_ASSERT(!create_inference_trainer_calls_.empty());
+    create_inference_trainer_call expected_call =
+        std::move(create_inference_trainer_calls_.front());
+    create_inference_trainer_calls_.pop_front();
+    return expected_call(checkpoint, std::move(context));
   }
 
   variant_type perform_evaluation(gl_sframe data, std::string metric,
@@ -192,6 +248,8 @@ public:
   mutable std::deque<create_iterator_call> create_iterator_calls_;
   mutable std::deque<create_compute_context_call> create_compute_context_calls_;
   mutable std::deque<create_trainer_call> create_trainer_calls_;
+  mutable std::deque<create_inference_trainer_call>
+      create_inference_trainer_calls_;
   mutable std::deque<perform_evaluation_call> perform_evaluation_calls_;
   mutable std::deque<convert_yolo_to_annotations_call>
       convert_yolo_to_annotations_calls_;
@@ -245,6 +303,7 @@ BOOST_AUTO_TEST_CASE(test_object_detector_iterate_training) {
         annotation.bounding_box.y = j;
 
         result[j].annotations.push_back(annotation);
+        result[j].image = std::make_shared<FakeImage>(256, 256);
         test_annotations->push_back(result[j].annotations);
       }
 
@@ -317,6 +376,12 @@ BOOST_AUTO_TEST_CASE(test_object_detector_iterate_training) {
   mock_context->create_augmenter_calls_.push_back(
       [&](const image_augmenter::options& opts) {
         return std::move(mock_augmenter);
+      });
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for inference, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
       });
   mock_context->create_object_detector_calls_.push_back(
       [&](int n, int c_in, int h_in, int w_in, int c_out, int h_out, int w_out,
@@ -395,14 +460,19 @@ BOOST_AUTO_TEST_CASE(test_object_detector_init_training) {
     return std::move(mock_augmenter);
   };
   mock_context->create_augmenter_calls_.push_back(create_augmenter_impl);
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for inference, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
+      });
 
   // We'll provide this path for the "mlmodel_path" option. When the
   // object_detector attempts to initialize weights from that path, just return
   // some arbitrary dummy params.
   const std::string test_mlmodel_path = "/test/foo.mlmodel";
   model.create_trainer_calls_.emplace_back(
-      [=](const Config& config, const std::string& pretrained_model_path,
-          int random_seed,
+      [=](const Config& config, const std::string& pretrained_model_path, int random_seed,
           std::unique_ptr<neural_net::compute_context> context) {
         TS_ASSERT_EQUALS(pretrained_model_path, test_mlmodel_path);
         TS_ASSERT_EQUALS(config.num_classes, test_class_labels.size());
@@ -521,6 +591,12 @@ BOOST_AUTO_TEST_CASE(test_object_detector_finalize_training) {
       [&](const image_augmenter::options& opts) {
         return std::move(mock_augmenter);
       });
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for inference, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
+      });
   mock_context->create_object_detector_calls_.push_back(
       [&](int n, int c_in, int h_in, int w_in, int c_out, int h_out, int w_out,
           const float_array_map& config,
@@ -615,6 +691,7 @@ BOOST_AUTO_TEST_CASE(test_object_detector_auto_split) {
         annotation.bounding_box.y = j;
 
         result[j].annotations.push_back(annotation);
+        result[j].image = std::make_shared<FakeImage>(256, 256);
         test_annotations->push_back(result[j].annotations);
       }
 
@@ -698,14 +775,19 @@ BOOST_AUTO_TEST_CASE(test_object_detector_auto_split) {
     return std::move(mock_augmenter);
   };
   mock_context->create_augmenter_calls_.push_back(create_augmenter_impl);
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for inference, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
+      });
 
   // We'll provide this path for the "mlmodel_path" option. When the
   // object_detector attempts to initialize weights from that path, just return
   // some arbitrary dummy params.
   const std::string test_mlmodel_path = "/test/foo.mlmodel";
   model.create_trainer_calls_.emplace_back(
-      [=](const Config& config, const std::string& pretrained_model_path,
-          int random_seed,
+      [=](const Config& config, const std::string& pretrained_model_path, int random_seed,
           std::unique_ptr<neural_net::compute_context> context) {
         TS_ASSERT_EQUALS(pretrained_model_path, test_mlmodel_path);
         TS_ASSERT_EQUALS(config.num_classes, test_class_labels.size());
@@ -850,6 +932,7 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
         annotation.bounding_box.y = j;
 
         result[j].annotations.push_back(annotation);
+        result[j].image = std::make_shared<FakeImage>(256, 256);
         test_annotations->push_back(result[j].annotations);
       }
 
@@ -919,14 +1002,19 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
     return std::move(mock_augmenter);
   };
   mock_context->create_augmenter_calls_.push_back(create_augmenter_impl);
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for inference, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
+      });
 
   // We'll provide this path for the "mlmodel_path" option. When the
   // object_detector attempts to initialize weights from that path, just return
   // some arbitrary dummy params.
   const std::string test_mlmodel_path = "/test/foo.mlmodel";
   model.create_trainer_calls_.emplace_back(
-      [=](const Config& config, const std::string& pretrained_model_path,
-          int random_seed,
+      [=](const Config& config, const std::string& pretrained_model_path, int random_seed,
           std::unique_ptr<neural_net::compute_context> context) {
         TS_ASSERT_EQUALS(pretrained_model_path, test_mlmodel_path);
         TS_ASSERT_EQUALS(config.num_classes, test_class_labels.size());
@@ -984,6 +1072,12 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
   model.create_compute_context_calls_.push_back(create_compute_context_impl);
 
   mock_augmenter.reset(new mock_image_augmenter);
+  mock_context->create_augmenter_calls_.push_back(
+      [&](const image_augmenter::options& opts) {
+        // The ModelTrainer will instantiate an augmenter for training, but
+        // we won't use it in this test.
+        return std::unique_ptr<image_augmenter>(new mock_image_augmenter);
+      });
   mock_context->create_augmenter_calls_.push_back(create_augmenter_impl);
 
   mock_nn_model.reset(new mock_model_backend);
@@ -1007,6 +1101,7 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
       annotation.bounding_box.y = j;
 
       result[j].annotations.push_back(annotation);
+      result[j].image = std::make_shared<FakeImage>(256, 256);
       test_annotations->push_back(result[j].annotations);
     }
 
@@ -1104,22 +1199,15 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
   mock_augmenter->prepare_images_calls_.push_back(prepare_images_impl);
   mock_nn_model->predict_calls_.push_back(predict_impl);
 
-  auto empty_next_batch_impl = [=](size_t batch_size) {
-    std::vector<labeled_image> result(0);
-    return result;
-  };
-  // Send empty batch to match perform_predict() implementation
-  mock_iterator->next_batch_calls_.push_back(empty_next_batch_impl);
-
-  auto convert_yolo_impl =
-      [](const neural_net::float_array& yolo_map,
-         const std::vector<std::pair<float, float>>& anchor_boxes,
-         float min_confidence) {
-        ASSERT_EQ(yolo_map.dim(), 3);
+  auto decode_output_batch_impl =
+      [](EncodedBatch batch, float confidence_threshold, float iou_threshold) {
+        const float_array& yolo_map = batch.encoded_data["output"];
+        ASSERT_EQ(yolo_map.dim(), 4);
         const size_t* const shape = yolo_map.shape();
-        const size_t output_height = shape[0];
-        const size_t output_width = shape[1];
-        const size_t num_channels = shape[2];
+        const size_t batch_size = shape[0];
+        const size_t output_height = shape[1];
+        const size_t output_width = shape[2];
+        const size_t num_channels = shape[3];
 
         size_t num_anchor_boxes = 2;
         static constexpr size_t NUM_CLASSES = 2;
@@ -1131,24 +1219,40 @@ BOOST_AUTO_TEST_CASE(test_object_detector_predict) {
         ASSERT_EQ(output_height, OUTPUT_GRID_SIZE);
         ASSERT_EQ(output_width, OUTPUT_GRID_SIZE);
 
-        std::vector<image_annotation> result;
-        for (size_t j = 0; j < num_prediction_instances; ++j) {
-          // The actual contents of the image and the annotations are irrelevant
-          // for the purposes of this test. But encode the batch index and row
-          // index into the bounding box so that we can verify this data is
-          // passed into the image augmenter.
-          image_annotation annotation;
-          annotation.bounding_box.x = 0;
-          annotation.bounding_box.y = j;
-          result.push_back(annotation);
+        InferenceOutputBatch result;
+        result.predictions.resize(batch_size);
+        for (size_t i = 0; i < batch_size; ++i) {
+          for (size_t j = 0; j < num_prediction_instances; ++j) {
+            // The actual contents of the image and the annotations are
+            // irrelevant for the purposes of this test. But encode the batch
+            // index and row index into the bounding box so that we can verify
+            // this data is passed into the image augmenter.
+            image_annotation annotation;
+            annotation.bounding_box.x = 0;
+            annotation.bounding_box.y = j;
+            result.predictions[i].push_back(annotation);
+          }
+          result.image_sizes.emplace_back(416, 416);
         }
         return result;
       };
+  model.create_inference_trainer_calls_.emplace_back(
+      [=](const Checkpoint& checkpoint,
+          std::unique_ptr<neural_net::compute_context> context) {
+        std::unique_ptr<TestDarknetYOLOModelTrainer> result;
+        DarknetYOLOCheckpoint darknet_yolo_checkpoint(checkpoint.config(),
+                                                      checkpoint.weights());
+        result.reset(new TestDarknetYOLOModelTrainer(darknet_yolo_checkpoint,
+                                                     context.get()));
 
-  // Two calls for two batches
-  for (size_t i = 0; i < 2 * test_batch_size; ++i) {
-    model.convert_yolo_to_annotations_calls_.push_back(convert_yolo_impl);
-  }
+        // Two calls for two batches
+        for (size_t i = 0; i < test_batch_size; ++i) {
+          result->decode_output_batch_calls_.push_back(
+              decode_output_batch_impl);
+        }
+        return result;
+      });
+
   std::map<std::string, flexible_type> opts{{"confidence_threshold",0.25}, {"iou_threshold",0.45}};
   variant_type result_variant = model.predict(data, opts);
   gl_sarray result = variant_get_value<gl_sarray>(result_variant);

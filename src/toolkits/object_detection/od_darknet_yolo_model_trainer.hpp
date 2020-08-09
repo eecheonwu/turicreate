@@ -23,7 +23,17 @@
 namespace turi {
 namespace object_detection {
 
-/** Configures an image_augmenter given darknet-yolo network parameters. */
+/**
+ * Configures an image_augmenter for inference given darknet-yolo network
+ * parameters.
+ */
+neural_net::image_augmenter::options DarknetYOLOInferenceAugmentationOptions(
+    int batch_size, int output_height, int output_width);
+
+/**
+ * Configures an image_augmenter for training given darknet-yolo network
+ * parameters.
+ */
 neural_net::image_augmenter::options DarknetYOLOTrainingAugmentationOptions(
     int batch_size, int output_height, int output_width);
 
@@ -36,19 +46,27 @@ EncodedInputBatch EncodeDarknetYOLO(InputBatch input_batch,
                                     size_t num_anchors, size_t num_classes);
 
 /**
+ * Decodes the raw inference output into structured predictions.
+ */
+InferenceOutputBatch DecodeDarknetYOLOInference(EncodedBatch batch,
+                                                float confidence_threshold,
+                                                float iou_threshold);
+
+/**
  * Wrapper that integrates a darknet-yolo model_backend into a training
  * pipeline.
  *
  * \todo Once model_backend exposes support for explicit asynchronous
  * invocations, this class won't be able to simply use the Transform base class.
  */
-class DarknetYOLOTrainer
+class DarknetYOLOBackendTrainingWrapper
     : public neural_net::Transform<EncodedInputBatch, TrainingOutputBatch> {
  public:
   // Uses base_learning_rate and max_iterations to determine the learning-rate
   // schedule.
-  DarknetYOLOTrainer(std::shared_ptr<neural_net::model_backend> impl,
-                     float base_learning_rate, int max_iterations)
+  DarknetYOLOBackendTrainingWrapper(
+      std::shared_ptr<neural_net::model_backend> impl, float base_learning_rate,
+      int max_iterations)
       : impl_(std::move(impl)),
         base_learning_rate_(base_learning_rate),
         max_iterations_(max_iterations) {}
@@ -61,6 +79,26 @@ class DarknetYOLOTrainer
   std::shared_ptr<neural_net::model_backend> impl_;
   float base_learning_rate_ = 0.f;
   int max_iterations_ = 0;
+};
+
+/**
+ * Wrapper that integrates a darknet-yolo model_backend into an inference
+ * pipeline.
+ *
+ * \todo Once model_backend exposes support for explicit asynchronous
+ * invocations, this class won't be able to simply use the Transform base class.
+ */
+class DarknetYOLOBackendInferenceWrapper
+    : public neural_net::Transform<EncodedInputBatch, EncodedBatch> {
+ public:
+  DarknetYOLOBackendInferenceWrapper(
+      std::shared_ptr<neural_net::model_backend> impl)
+      : impl_(std::move(impl)) {}
+
+  EncodedBatch Invoke(EncodedInputBatch input_batch) override;
+
+ private:
+  std::shared_ptr<neural_net::model_backend> impl_;
 };
 
 /**
@@ -92,8 +130,7 @@ class DarknetYOLOCheckpoint : public Checkpoint {
    * Initializes a new model, combining the pre-trained warm-start weights with
    * random initialization for the final layers.
    */
-  DarknetYOLOCheckpoint(Config config, const std::string& pretrained_model_path,
-                        int random_seed);
+  DarknetYOLOCheckpoint(Config config, const std::string& pretrained_model_path, int random_seed);
 
   /** Loads weights saved from a DarknetYOLOModelTrainer. */
   DarknetYOLOCheckpoint(Config config, neural_net::float_array_map weights);
@@ -104,9 +141,13 @@ class DarknetYOLOCheckpoint : public Checkpoint {
   std::unique_ptr<ModelTrainer> CreateModelTrainer(
       neural_net::compute_context* context) const override;
 
-  neural_net::pipeline_spec ExportToCoreML(
-      const std::string& input_name, const std::string& coordinates_output_name,
-      const std::string& confidence_output_name) const override;
+  neural_net::pipeline_spec ExportToCoreML(const std::string& input_name,
+                                           const std::string& coordinates_name,
+                                           const std::string& confidence_name, bool use_nms_layer,
+                                           float iou_threshold,
+                                           float confidence_threshold) const override;
+
+  CheckpointMetadata GetCheckpointMetadata() const override;
 
   /** Returns the config dictionary used to initialize darknet-yolo backends. */
   neural_net::float_array_map internal_config() const;
@@ -130,6 +171,19 @@ class DarknetYOLOModelTrainer : public ModelTrainer {
   DarknetYOLOModelTrainer(const DarknetYOLOCheckpoint& checkpoint,
                           neural_net::compute_context* context);
 
+  std::shared_ptr<neural_net::Publisher<TrainingOutputBatch>>
+  AsTrainingBatchPublisher(std::unique_ptr<data_iterator> training_data,
+                           size_t batch_size, int offset) override;
+
+  std::shared_ptr<neural_net::Publisher<EncodedBatch>>
+  AsInferenceBatchPublisher(std::unique_ptr<data_iterator> test_data,
+                            size_t batch_size, float confidence_threshold,
+                            float iou_threshold) override;
+
+  InferenceOutputBatch DecodeOutputBatch(EncodedBatch batch,
+                                         float confidence_threshold,
+                                         float iou_threshold) override;
+
   std::shared_ptr<neural_net::Publisher<std::unique_ptr<Checkpoint>>>
   AsCheckpointPublisher() override;
 
@@ -141,6 +195,8 @@ class DarknetYOLOModelTrainer : public ModelTrainer {
  private:
   Config config_;
   std::shared_ptr<neural_net::model_backend> backend_;
+  std::shared_ptr<DataAugmenter> training_augmenter_;
+  std::shared_ptr<DataAugmenter> inference_augmenter_;
 };
 
 }  // namespace object_detection
